@@ -5,13 +5,16 @@
 //+------------------------------------------------------------------+
 #property copyright "AntiGravity Assistant"
 #property link      "https://github.com/google-deepmind/"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
+
+#include <Trade\Trade.mqh>
 
 //--- Input parameters
 input int      InpLookbackDays       = 60;           // Lookback Days for Magic Discovery
 input int      InpRefreshRateSeconds = 1;            // Refresh Rate (seconds)
 input int      InpHelpXPosition      = 950;          // Help Text X Position
+input bool     InpEnableAutoStop     = true;         // Enable Emergency Stop
 
 // Drawdown limit configurations (format: "MagicNumber,MaxDrawdown")
 input string   InpCheck1  = "";  // Check 1: Magic,MaxDD
@@ -46,6 +49,7 @@ private:
    double   m_current_drawdown; 
    double   m_max_drawdown;
    double   m_max_allowed_drawdown; // Configured limit
+   bool     m_emergency_stopped;    // Emergency stop flag
    
    // Optimization members
    datetime m_last_history_time;
@@ -59,6 +63,7 @@ public:
       m_max_equity = -DBL_MAX; 
       m_current_drawdown = 0.0;
       m_max_drawdown = 0.0;
+      m_emergency_stopped = false;
       
       m_last_history_time = 0;
       m_last_deal_ticket = 0;
@@ -83,8 +88,10 @@ public:
    }
    
    double GetMaxAllowedDrawdown() const { return m_max_allowed_drawdown; }
+   bool IsEmergencyStopped() const { return m_emergency_stopped; }
    
    color GetRowColor() const {
+      if(m_emergency_stopped) return clrGray; // Stopped magic
       if(m_max_allowed_drawdown <= 0.0) return clrWhite; // No limit configured
       
       // Compare percentage drawdown with percentage limit
@@ -95,6 +102,44 @@ public:
       if(ratio >= 0.9) return clrOrange;   // 90% or more
       if(ratio >= 0.8) return clrYellow;   // 80% or more
       return clrWhite;                      // Below 80%
+   }
+   
+   void TriggerEmergencyStop() {
+      if(m_emergency_stopped) return; // Already stopped
+      
+      m_emergency_stopped = true;
+      
+      // 1. Close all positions for this magic
+      CloseAllPositionsByMagic(m_magic);
+      
+      // 2. Set global variable
+      string var_name = "EDM_STOP_MAGIC_" + IntegerToString(m_magic);
+      GlobalVariableSet(var_name, 1);
+      
+      // 3. Send Email
+      string subject = "EMERGENCY STOP - Magic " + IntegerToString(m_magic);
+      string body = StringFormat(
+         "DRAWDOWN LIMIT ERREICHT!\n\n" +
+         "Magic Number: %d\n" +
+         "Aktueller Drawdown: %.1f%%\n" +
+         "Limit: %.1f%%\n\n" +
+         "Alle Positionen wurden geschlossen!\n" +
+         "Zeit: %s",
+         m_magic, 
+         GetDrawdownPercent(), 
+         m_max_allowed_drawdown,
+         TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS)
+      );
+      
+      if(!SendMail(subject, body)) {
+         Print("Failed to send email. Check MT5 Email settings!");
+      }
+      
+      // 4. Log
+      Print("EMERGENCY STOP triggered for Magic ", m_magic);
+      
+      // 5. Show alert
+      ShowEmergencyAlert(m_magic, GetDrawdownPercent(), m_max_allowed_drawdown);
    }
 
    // Core logic to process history within a time range
@@ -181,6 +226,14 @@ public:
       // Update Max Drawdown
       if(m_current_drawdown > m_max_drawdown) {
          m_max_drawdown = m_current_drawdown;
+      }
+      
+      // Check for emergency stop
+      if(InpEnableAutoStop && !m_emergency_stopped && m_max_allowed_drawdown > 0.0) {
+         double current_dd_percent = GetDrawdownPercent();
+         if(current_dd_percent >= m_max_allowed_drawdown) {
+            TriggerEmergencyStop();
+         }
       }
    }
 };
@@ -343,6 +396,42 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 //+------------------------------------------------------------------+
 //| Custom functions                                                 |
 //+------------------------------------------------------------------+
+void CloseAllPositionsByMagic(long magic) {
+   CTrade trade;
+   trade.SetAsyncMode(false); // Synchronous mode
+   
+   // Loop backwards to handle position array changes
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0) {
+         if(PositionGetInteger(POSITION_MAGIC) == magic) {
+            if(!trade.PositionClose(ticket)) {
+               Print("Failed to close position ", ticket, " for Magic ", magic, ". Error: ", GetLastError());
+            } else {
+               Print("Closed position ", ticket, " for Magic ", magic);
+            }
+         }
+      }
+   }
+}
+
+void ShowEmergencyAlert(long magic, double dd_percent, double limit) {
+   string message = StringFormat(
+      "⚠ DRAWDOWN LIMIT ERREICHT! ⚠\n\n" +
+      "Magic Number: %d\n" +
+      "Aktueller Drawdown: %.1f%%\n" +
+      "Konfiguriertes Limit: %.1f%%\n\n" +
+      "ALLE POSITIONEN GESCHLOSSEN!\n\n" +
+      "Globale Variable gesetzt:\n" +
+      "EDM_STOP_MAGIC_%d = 1\n\n" +
+      "Andere EAs mit dieser Magic müssen\n" +
+      "diese Variable prüfen!",
+      magic, dd_percent, limit, magic
+   );
+   
+   MessageBox(message, "EMERGENCY STOP - Magic " + IntegerToString(magic), MB_OK | MB_ICONERROR);
+}
+
 void DrawLabel(string name, string text, int x, int y, int size=10, color clr=clrWhite) {
    if(ObjectFind(0, name) < 0) {
       ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
@@ -399,15 +488,18 @@ void ShowHelp(int y_start) {
    
    DrawLabel("EDM_Help_8", "MaxAlw: Konfiguriertes Drawdown-Limit", x, y, 9, clrSilver);
    y += step;
-   DrawLabel("EDM_Help_9", "  -> Zeile wird ROT bei DD% >= 100% vom Limit", x, y, 9, clrRed);
+   DrawLabel("EDM_Help_9", "  -> Bei DD% >= Limit: EMERGENCY STOP!", x, y, 9, clrRed);
    y += step;
-   DrawLabel("EDM_Help_10", "  -> Zeile wird ORANGE bei DD% >= 90% vom Limit", x, y, 9, clrOrange);
+   DrawLabel("EDM_Help_10", "  -> Alle Positionen werden geschlossen", x, y, 9, clrOrange);
    y += step;
-   DrawLabel("EDM_Help_11", "  -> Zeile wird GELB bei DD% >= 80% vom Limit", x, y, 9, clrYellow);
+   DrawLabel("EDM_Help_11", "  -> Status wird auf STOPPED gesetzt", x, y, 9, clrYellow);
+   y += step * 2;
+   
+   DrawLabel("EDM_Help_12", "Status: ACTIVE = Normal / STOPPED = Limit erreicht", x, y, 9, clrSilver);
 }
 
 void HideHelp() {
-   for(int i = 1; i <= 11; i++) {
+   for(int i = 1; i <= 12; i++) {
       ObjectDelete(0, "EDM_Help_" + IntegerToString(i));
    }
    ObjectDelete(0, "EDM_Help_Title");
@@ -421,7 +513,7 @@ void UpdateDashboard() {
    CreateInfoButton();
    
    // Title
-   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor", 20, y_base, 12, clrWhite);
+   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.10", 20, y_base, 12, clrWhite);
    y_base += 26;
    
    if(show_help) {
@@ -434,26 +526,29 @@ void UpdateDashboard() {
    }
    
    // Header
-   string header = StringFormat("%-6s | %-7s | %-7s | %-7s | %-6s | %-6s | %-6s", 
-                        "Magic", "Realzd", "Float", "Equity", "DD%", "MaxDD%", "MaxAlw");
+   string header = StringFormat("%-6s | %-7s | %-7s | %-7s | %-6s | %-6s | %-6s | %-7s", 
+                        "Magic", "Realzd", "Float", "Equity", "DD%", "MaxDD%", "MaxAlw", "Status");
    DrawLabel("EDM_Label_Header", header, 20, y_base, 10, clrSilver);
    y_base += y_step;
    
-   DrawLabel("EDM_Label_Sep", "-------------------------------------------------------------------", 20, y_base, 10, clrSilver);
+   DrawLabel("EDM_Label_Sep", "-------------------------------------------------------------------------------", 20, y_base, 10, clrSilver);
    y_base += y_step;
    
    for(int i = 0; i < monitor_count; i++) {
       string max_allowed_str = monitors[i].GetMaxAllowedDrawdown() > 0 ? 
                                DoubleToString(monitors[i].GetMaxAllowedDrawdown(), 1) + "%" : "--";
       
-      string line = StringFormat("%-6d | %-7.1f | %-7.1f | %-7.1f | %-6.1f%% | %-6.1f%% | %-6s",
+      string status_str = monitors[i].IsEmergencyStopped() ? "STOPPED" : "ACTIVE";
+      
+      string line = StringFormat("%-6d | %-7.1f | %-7.1f | %-7.1f | %-6.1f%% | %-6.1f%% | %-6s | %-7s",
          monitors[i].GetMagic(),
          monitors[i].GetRealizedOutput(),
          monitors[i].GetFloating(),
          monitors[i].GetEquity(),
          monitors[i].GetDrawdownPercent(),
          monitors[i].GetMaxDrawdownPercent(),
-         max_allowed_str
+         max_allowed_str,
+         status_str
       );
       
       color row_color = monitors[i].GetRowColor();
