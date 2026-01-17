@@ -95,6 +95,40 @@ m_last_history_time
 ProcessHistory(m_last_history_time, TimeCurrent())
 ```
 
+### 8. Emergency Stop bei Drawdown-Überschreitung
+
+Wenn der Drawdown das konfigurierte Limit erreicht, wird automatisch ein **Emergency Stop** ausgelöst:
+
+- **Alle Positionen schließen**: Alle offenen Trades der betroffenen Magic Number werden sofort geschlossen
+- **MessageBox Alarm**: Ein Popup informiert Sie über den Emergency Stop
+- **E-Mail Benachrichtigung**: Eine E-Mail wird versendet (SMTP-Konfiguration in MT5 erforderlich)
+- **Global Variable**: `EDM_STOP_MAGIC_{Magic}` wird auf 1 gesetzt
+- **Status-Anzeige**: Die Zeile zeigt "STOPPED" in der Status-Spalte
+
+**Konfiguration**: `InpEnableAutoStop` (Standard: true)
+
+### 9. Manueller Reset
+
+Ein gestoppter Robot kann wieder aktiviert werden:
+
+1. Drücken Sie **F3** in MT5 (Globale Variablen)
+2. Suchen Sie `EDM_STOP_MAGIC_12345` (Ihre Magic Number)
+3. **Löschen** Sie den Eintrag
+4. Der Monitor erkennt das automatisch und setzt den Status zurück auf "ACTIVE"
+
+### 10. Chart-Info Logging
+
+Beim Start des EAs werden alle offenen Charts im Log protokolliert:
+
+```
+=== Chart Information ===
+Chart ID: 131234567890 | Symbol: EURUSD | Period: PERIOD_H1
+   -> Objects: 150 | Types: OBJ_LABEL, OBJ_BUTTON, OBJ_TREND
+=========================
+```
+
+Dies hilft bei der Identifizierung aktiver EAs auf verschiedenen Charts.
+
 ### 7. Interaktiver Info-Button
 
 Ein **"?"** Button rechts oben öffnet eine Hilfe-Erklärung:
@@ -140,6 +174,11 @@ Die Magic Number der Strategie (z.B. 0, 12345, 67890)
 - Wird als Prozentsatz angezeigt
 - **"--"** wenn kein Limit konfiguriert ist
 
+### Status
+- **ACTIVE**: Normale Überwachung aktiv
+- **STOPPED**: Emergency Stop wurde ausgelöst
+- Zeile wird **GRAU** wenn Status = STOPPED
+
 ## Konfigurationsparameter
 
 ### InpLookbackDays
@@ -163,6 +202,11 @@ Die Magic Number der Strategie (z.B. 0, 12345, 67890)
 - **Format**: `"MagicNumber,MaxDrawdown"`
 - **Beispiel**: `"12345,3.5"` = Magic 12345 hat ein Limit von 3.5%
 - **Beschreibung**: Konfigurierbare Drawdown-Limits für bis zu 20 Magic Numbers
+
+### InpEnableAutoStop
+- **Typ**: Bool
+- **Standard**: true
+- **Beschreibung**: Aktiviert/Deaktiviert den Emergency Stop bei Limit-Überschreitung
 
 ## Installation & Verwendung
 
@@ -324,7 +368,7 @@ CMagicMonitor (Klasse)
 ## Lizenz & Support
 
 **Entwickelt von**: AntiGravity Assistant  
-**Version**: 1.00  
+**Version**: 1.10  
 **Lizenz**: [Ihre Lizenz hier]
 
 Für Support und Fragen, bitte erstellen Sie ein Issue im Repository.

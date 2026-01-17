@@ -499,14 +499,14 @@ void ShowEmergencyAlert(long magic, double dd_percent, double limit) {
 void DrawLabel(string name, string text, int x, int y, int size=10, color clr=clrWhite) {
    if(ObjectFind(0, name) < 0) {
       ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
-      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
       ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetString(0, name, OBJPROP_FONT, "Consolas"); 
-      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
    }
    ObjectSetString(0, name, OBJPROP_TEXT, text);
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetString(0, name, OBJPROP_FONT, "Consolas"); // Ensure font is always set
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x); 
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
 }
 
 void CreateInfoButton() {
@@ -570,6 +570,9 @@ void HideHelp() {
 }
 
 void UpdateDashboard() {
+   // CRITICAL: Delete ALL old EDM labels first to prevent overlap issues
+   ObjectsDeleteAll(0, "EDM_Label_");
+   
    int y_base = 20;
    int y_step = 22; // Adjusted for smaller font
    
@@ -589,34 +592,45 @@ void UpdateDashboard() {
       HideHelp(); // Make sure help is hidden
    }
    
-   // Header
-   string header = StringFormat("%-6s | %-7s | %-7s | %-7s | %-6s | %-6s | %-6s | %-7s", 
-                        "Magic", "Realzd", "Float", "Equity", "DD%", "MaxDD%", "MaxAlw", "Status");
-   DrawLabel("EDM_Label_Header", header, 20, y_base, 10, clrSilver);
+   // ===== CELL-BASED TABLE LAYOUT =====
+   // Each column has a fixed X position for pixel-perfect alignment
+   // Increased spacing by 30% for better readability
+   int col_x[8] = {20, 115, 250, 380, 520, 625, 730, 835}; // X positions for 8 columns
+   
+   // Header row
+   DrawLabel("EDM_Col_0_H", "Magic",   col_x[0], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_1_H", "Realzd",  col_x[1], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_2_H", "Float",   col_x[2], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_3_H", "Equity",  col_x[3], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_4_H", "DD%",     col_x[4], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_5_H", "MaxDD%",  col_x[5], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_6_H", "MaxAlw",  col_x[6], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_7_H", "Status",  col_x[7], y_base, 10, clrSilver);
    y_base += y_step;
    
-   DrawLabel("EDM_Label_Sep", "-------------------------------------------------------------------------------", 20, y_base, 10, clrSilver);
+   // Separator line
+   DrawLabel("EDM_Sep", "---------------------------------------------------------------------------------------------", 20, y_base, 10, clrSilver);
    y_base += y_step;
    
+   // Data rows
    for(int i = 0; i < monitor_count; i++) {
+      string row = IntegerToString(i);
+      color row_color = monitors[i].GetRowColor();
+      
       string max_allowed_str = monitors[i].GetMaxAllowedDrawdown() > 0 ? 
                                DoubleToString(monitors[i].GetMaxAllowedDrawdown(), 1) + "%" : "--";
-      
       string status_str = monitors[i].IsEmergencyStopped() ? "STOPPED" : "ACTIVE";
       
-      string line = StringFormat("%-6d | %-7.1f | %-7.1f | %-7.1f | %-6.1f%% | %-6.1f%% | %-6s | %-7s",
-         monitors[i].GetMagic(),
-         monitors[i].GetRealizedOutput(),
-         monitors[i].GetFloating(),
-         monitors[i].GetEquity(),
-         monitors[i].GetDrawdownPercent(),
-         monitors[i].GetMaxDrawdownPercent(),
-         max_allowed_str,
-         status_str
-      );
+      // Draw each cell individually at fixed X positions
+      DrawLabel("EDM_R"+row+"_C0", IntegerToString(monitors[i].GetMagic()),                col_x[0], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C1", DoubleToString(monitors[i].GetRealizedOutput(), 1),     col_x[1], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C2", DoubleToString(monitors[i].GetFloating(), 1),           col_x[2], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C3", DoubleToString(monitors[i].GetEquity(), 1),             col_x[3], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C4", DoubleToString(monitors[i].GetDrawdownPercent(), 1)+"%",col_x[4], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C5", DoubleToString(monitors[i].GetMaxDrawdownPercent(),1)+"%",col_x[5], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C6", max_allowed_str,                                        col_x[6], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C7", status_str,                                             col_x[7], y_base, 10, row_color);
       
-      color row_color = monitors[i].GetRowColor();
-      DrawLabel("EDM_Label_Row_"+IntegerToString(i), line, 20, y_base, 10, row_color);
       y_base += y_step;
    }
 }
