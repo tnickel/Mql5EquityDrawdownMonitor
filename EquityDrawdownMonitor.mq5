@@ -235,6 +235,15 @@ public:
             TriggerEmergencyStop();
          }
       }
+      
+      // Check for Manual Reset (User deleted Global Variable)
+      if(m_emergency_stopped) {
+         string var_name = "EDM_STOP_MAGIC_" + IntegerToString(m_magic);
+         if(!GlobalVariableCheck(var_name)) {
+            m_emergency_stopped = false;
+            Print("Manual Reset detected for Magic ", m_magic, " - Monitoring resumed!");
+         }
+      }
    }
 };
 
@@ -339,6 +348,61 @@ int OnInit()
    }
    
    Print("Discovered ", monitor_count, " magic numbers in last ", InpLookbackDays, " days");
+   
+   // Enumerate all charts and log their information
+   Print("=== Chart Information ===");
+   long cid = ChartFirst();
+   while(cid >= 0) {
+      string comment;
+      ChartGetString(cid, CHART_COMMENT, comment);
+      
+      Print("Chart ID: ", cid,
+            " | Symbol: ", ChartSymbol(cid),
+            " | Period: ", EnumToString((ENUM_TIMEFRAMES)ChartPeriod(cid)),
+            " | Comment: ", comment);
+            
+      // List objects on this chart
+      int obj_total = ObjectsTotal(cid);
+      string obj_summary = "";
+      
+      if(obj_total > 0) {
+         int unique_types[5];
+         int unique_count = 0;
+         ArrayInitialize(unique_types, -1);
+         
+         // Scan objects to find first 5 unique types
+         // Limit scan to first 1000 objects for performance
+         int scan_limit = MathMin(obj_total, 1000); 
+         
+         for(int i = 0; i < scan_limit && unique_count < 5; i++) {
+            string obj_name = ObjectName(cid, i);
+            int obj_type = (int)ObjectGetInteger(cid, obj_name, OBJPROP_TYPE);
+            
+            // Check uniqueness
+            bool is_new = true;
+            for(int j = 0; j < unique_count; j++) {
+               if(unique_types[j] == obj_type) {
+                  is_new = false;
+                  break;
+               }
+            }
+            
+            if(is_new) {
+               unique_types[unique_count] = obj_type;
+               if(unique_count > 0) obj_summary += ", ";
+               obj_summary += EnumToString((ENUM_OBJECT)obj_type);
+               unique_count++;
+            }
+         }
+         
+         if(unique_count < 5 && obj_total > scan_limit) obj_summary += ", ...";
+      }
+      
+      Print("   -> Objects: ", obj_total, " | Types: ", obj_summary);
+      
+      cid = ChartNext(cid);
+   }
+   Print("=========================");
    
    // Setup timer
    EventSetTimer(InpRefreshRateSeconds);
