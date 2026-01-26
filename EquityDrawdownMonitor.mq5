@@ -38,6 +38,17 @@ input string   InpCheck18 = "";  // Check 18: Magic,MaxDD
 input string   InpCheck19 = "";  // Check 19: Magic,MaxDD
 input string   InpCheck20 = "";  // Check 20: Magic,MaxDD
 
+//--- Config file settings
+string g_config_file = "DrawdownMonitorConfig.csv";
+bool g_config_loaded = false;
+
+// Runtime settings (can be loaded from file)
+int g_lookback_days = 60;
+int g_refresh_rate = 1;
+int g_help_x_position = 950;
+bool g_enable_auto_stop = true;
+string g_check_values[20];
+
 //--- Class to monitor a single Magic Number
 class CMagicMonitor {
 private:
@@ -50,6 +61,7 @@ private:
    double   m_max_drawdown;
    double   m_max_allowed_drawdown; // Configured limit
    bool     m_emergency_stopped;    // Emergency stop flag
+   string   m_comment;              // EA comment (max 10 chars)
    
    // Optimization members
    datetime m_last_history_time;
@@ -67,6 +79,7 @@ public:
       
       m_last_history_time = 0;
       m_last_deal_ticket = 0;
+      m_comment = "";
    }
 
    long GetMagic() const { return m_magic; }
@@ -89,6 +102,7 @@ public:
    
    double GetMaxAllowedDrawdown() const { return m_max_allowed_drawdown; }
    bool IsEmergencyStopped() const { return m_emergency_stopped; }
+   string GetComment() const { return m_comment; }
    
    color GetRowColor() const {
       if(m_emergency_stopped) return clrGray; // Stopped magic
@@ -184,12 +198,68 @@ public:
       // Load everything from start of time until now
       ProcessHistory(0, TimeCurrent());
       
+      // Search for comment in deal history
+      if(StringLen(m_comment) == 0) {
+         FindCommentFromHistory();
+      }
+      
+      // Also check current open positions for comment
+      if(StringLen(m_comment) == 0) {
+         FindCommentFromPositions();
+      }
+      
       // Initialize equity - this is the starting point, the "high water mark"
       m_current_equity = m_realized_profit;
       // Start with current equity as max (even if negative - it's still the highest we've seen)
       m_max_equity = m_current_equity;
       // No drawdown at start
       m_current_drawdown = 0.0;
+   }
+   
+   // Find comment from deal history
+   void FindCommentFromHistory() {
+      if(!HistorySelect(0, TimeCurrent())) return;
+      
+      int total_deals = HistoryDealsTotal();
+      // Search backwards to find most recent comment
+      for(int i = total_deals - 1; i >= 0; i--) {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket > 0) {
+            long deal_magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+            if(deal_magic == m_magic) {
+               string deal_comment = HistoryDealGetString(ticket, DEAL_COMMENT);
+               if(StringLen(deal_comment) > 0) {
+                  if(StringLen(deal_comment) > 30) {
+                     m_comment = StringSubstr(deal_comment, 0, 30);
+                  } else {
+                     m_comment = deal_comment;
+                  }
+                  return; // Found a comment, stop searching
+               }
+            }
+         }
+      }
+   }
+   
+   // Find comment from open positions
+   void FindCommentFromPositions() {
+      int total_positions = PositionsTotal();
+      for(int i = 0; i < total_positions; i++) {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0) {
+            if(PositionGetInteger(POSITION_MAGIC) == m_magic) {
+               string pos_comment = PositionGetString(POSITION_COMMENT);
+               if(StringLen(pos_comment) > 0) {
+                  if(StringLen(pos_comment) > 30) {
+                     m_comment = StringSubstr(pos_comment, 0, 30);
+                  } else {
+                     m_comment = pos_comment;
+                  }
+                  return; // Found a comment, stop searching
+               }
+            }
+         }
+      }
    }
 
    // Update floating profit and stats
@@ -208,6 +278,15 @@ public:
                double profit = PositionGetDouble(POSITION_PROFIT);
                double swap = PositionGetDouble(POSITION_SWAP);
                m_floating_profit += (profit + swap);
+               // Capture comment (only if not already set or empty)
+               if(StringLen(m_comment) == 0) {
+                  string pos_comment = PositionGetString(POSITION_COMMENT);
+                  if(StringLen(pos_comment) > 30) {
+                     m_comment = StringSubstr(pos_comment, 0, 30);
+                  } else {
+                     m_comment = pos_comment;
+                  }
+               }
             }
          }
       }
@@ -229,7 +308,7 @@ public:
       }
       
       // Check for emergency stop
-      if(InpEnableAutoStop && !m_emergency_stopped && m_max_allowed_drawdown > 0.0) {
+      if(g_enable_auto_stop && !m_emergency_stopped && m_max_allowed_drawdown > 0.0) {
          double current_dd_percent = GetDrawdownPercent();
          if(current_dd_percent >= m_max_allowed_drawdown) {
             TriggerEmergencyStop();
@@ -257,15 +336,33 @@ bool show_help = false; // Toggle for help text display
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   // Parse drawdown limits into a map
-   string check_inputs[];
-   ArrayResize(check_inputs, 20);
-   check_inputs[0] = InpCheck1; check_inputs[1] = InpCheck2; check_inputs[2] = InpCheck3; check_inputs[3] = InpCheck4;
-   check_inputs[4] = InpCheck5; check_inputs[5] = InpCheck6; check_inputs[6] = InpCheck7; check_inputs[7] = InpCheck8;
-   check_inputs[8] = InpCheck9; check_inputs[9] = InpCheck10; check_inputs[10] = InpCheck11; check_inputs[11] = InpCheck12;
-   check_inputs[12] = InpCheck13; check_inputs[13] = InpCheck14; check_inputs[14] = InpCheck15; check_inputs[15] = InpCheck16;
-   check_inputs[16] = InpCheck17; check_inputs[17] = InpCheck18; check_inputs[18] = InpCheck19; check_inputs[19] = InpCheck20;
+   // Check if this is a parameter change (user modified settings in EA dialog)
+   static bool first_init = true;
+   bool params_changed = !first_init; // If not first init, user likely changed parameters
+   first_init = false;
    
+   // 1. Config loading logic:
+   // - If parameters were changed by user -> use input parameters, update config
+   // - If first start and config exists -> load from config
+   // - If first start and no config -> use input parameters, create config
+   
+   if(params_changed) {
+      // User changed parameters in EA dialog - use new values and update config
+      InitSettingsFromInputs();
+      SaveConfigToFile();
+      Print("Parameters changed - config file updated.");
+   }
+   else if(!LoadConfigFromFile()) {
+      // No config file found - use input parameters
+      InitSettingsFromInputs();
+      // Save config for next startup
+      SaveConfigToFile();
+      Print("Initialized from input parameters, config file created.");
+   } else {
+      Print("Initialized from config file.");
+   }
+   
+   // 2. Parse drawdown limits from runtime settings (g_check_values[])
    // Structure to hold magic -> max_dd mapping
    long limit_magics[20];
    double limit_values[20];
@@ -278,9 +375,9 @@ int OnInit()
    }
    
    for(int i = 0; i < 20; i++) {
-      if(StringLen(check_inputs[i]) > 0) {
+      if(StringLen(g_check_values[i]) > 0) {
          string parts[];
-         if(StringSplit(check_inputs[i], ',', parts) == 2) {
+         if(StringSplit(g_check_values[i], ',', parts) == 2) {
             long magic = StringToInteger(parts[0]);
             double max_dd = StringToDouble(parts[1]);
             limit_magics[limit_count] = magic;
@@ -291,7 +388,7 @@ int OnInit()
    }
    
    // Auto-discover Magic Numbers from history
-   datetime lookback_time = TimeCurrent() - (InpLookbackDays * 86400);
+   datetime lookback_time = TimeCurrent() - (g_lookback_days * 86400);
    
    if(!HistorySelect(lookback_time, TimeCurrent())) {
       Print("Failed to select history for magic discovery");
@@ -347,7 +444,7 @@ int OnInit()
       monitors[i].InitFromHistory();
    }
    
-   Print("Discovered ", monitor_count, " magic numbers in last ", InpLookbackDays, " days");
+   Print("Discovered ", monitor_count, " magic numbers in last ", g_lookback_days, " days");
    
    // Enumerate all charts and log their information
    Print("=== Chart Information ===");
@@ -405,7 +502,7 @@ int OnInit()
    Print("=========================");
    
    // Setup timer
-   EventSetTimer(InpRefreshRateSeconds);
+   EventSetTimer(g_refresh_rate);
    
    // Initial display
    UpdateDashboard();
@@ -528,7 +625,7 @@ void CreateInfoButton() {
 void ShowHelp(int y_start) {
    int y = y_start;
    int step = 18;
-   int x = InpHelpXPosition; // Use configurable position
+   int x = g_help_x_position; // Use configurable position
    
    DrawLabel("EDM_Help_Title", "=== SPALTEN-ERKLÄRUNG ===", x, y, 10, clrYellow);
    y += step * 2;
@@ -594,8 +691,8 @@ void UpdateDashboard() {
    
    // ===== CELL-BASED TABLE LAYOUT =====
    // Each column has a fixed X position for pixel-perfect alignment
-   // Increased spacing by 30% for better readability
-   int col_x[8] = {20, 115, 250, 380, 520, 625, 730, 835}; // X positions for 8 columns
+   // Increased spacing for better readability with long magic numbers (up to 12 digits)
+   int col_x[9] = {20, 170, 305, 435, 555, 660, 765, 870, 1015}; // X positions for 9 columns
    
    // Header row
    DrawLabel("EDM_Col_0_H", "Magic",   col_x[0], y_base, 10, clrSilver);
@@ -606,10 +703,11 @@ void UpdateDashboard() {
    DrawLabel("EDM_Col_5_H", "MaxDD%",  col_x[5], y_base, 10, clrSilver);
    DrawLabel("EDM_Col_6_H", "MaxAlw",  col_x[6], y_base, 10, clrSilver);
    DrawLabel("EDM_Col_7_H", "Status",  col_x[7], y_base, 10, clrSilver);
+   DrawLabel("EDM_Col_8_H", "Comment", col_x[8], y_base, 10, clrSilver);
    y_base += y_step;
    
    // Separator line
-   DrawLabel("EDM_Sep", "---------------------------------------------------------------------------------------------", 20, y_base, 10, clrSilver);
+   DrawLabel("EDM_Sep", "----------------------------------------------------------------------------------------------------------------------------------------", 20, y_base, 10, clrSilver);
    y_base += y_step;
    
    // Data rows
@@ -620,6 +718,8 @@ void UpdateDashboard() {
       string max_allowed_str = monitors[i].GetMaxAllowedDrawdown() > 0 ? 
                                DoubleToString(monitors[i].GetMaxAllowedDrawdown(), 1) + "%" : "--";
       string status_str = monitors[i].IsEmergencyStopped() ? "STOPPED" : "ACTIVE";
+      string comment_str = monitors[i].GetComment();
+      if(StringLen(comment_str) == 0) comment_str = "--";
       
       // Draw each cell individually at fixed X positions
       DrawLabel("EDM_R"+row+"_C0", IntegerToString(monitors[i].GetMagic()),                col_x[0], y_base, 10, row_color);
@@ -630,7 +730,137 @@ void UpdateDashboard() {
       DrawLabel("EDM_R"+row+"_C5", DoubleToString(monitors[i].GetMaxDrawdownPercent(),1)+"%",col_x[5], y_base, 10, row_color);
       DrawLabel("EDM_R"+row+"_C6", max_allowed_str,                                        col_x[6], y_base, 10, row_color);
       DrawLabel("EDM_R"+row+"_C7", status_str,                                             col_x[7], y_base, 10, row_color);
+      DrawLabel("EDM_R"+row+"_C8", comment_str,                                            col_x[8], y_base, 10, row_color);
       
       y_base += y_step;
    }
+}
+
+//+------------------------------------------------------------------+
+//| Load configuration from file                                      |
+//+------------------------------------------------------------------+
+bool LoadConfigFromFile() {
+   if(!FileIsExist(g_config_file)) {
+      Print("Config file not found: ", g_config_file);
+      return false;
+   }
+   
+   int handle = FileOpen(g_config_file, FILE_READ|FILE_CSV|FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE) {
+      Print("Failed to open config file: ", g_config_file);
+      return false;
+   }
+   
+   // Initialize check values to empty
+   for(int i = 0; i < 20; i++) {
+      g_check_values[i] = "";
+   }
+   
+   while(!FileIsEnding(handle)) {
+      string key = FileReadString(handle);
+      string value = FileReadString(handle);
+      
+      // Skip empty lines and comments
+      if(StringLen(key) == 0 || StringGetCharacter(key, 0) == '#') {
+         continue;
+      }
+      
+      // Parse settings
+      if(key == "LookbackDays") {
+         g_lookback_days = (int)StringToInteger(value);
+      }
+      else if(key == "RefreshRate") {
+         g_refresh_rate = (int)StringToInteger(value);
+      }
+      else if(key == "HelpXPosition") {
+         g_help_x_position = (int)StringToInteger(value);
+      }
+      else if(key == "EnableAutoStop") {
+         g_enable_auto_stop = (value == "true" || value == "1");
+      }
+      else if(StringFind(key, "Check") == 0) {
+         // Parse Check1, Check2, etc.
+         int check_num = (int)StringToInteger(StringSubstr(key, 5));
+         if(check_num >= 1 && check_num <= 20) {
+            // Read the third column (MaxDD value)
+            string max_dd = FileReadString(handle);
+            if(StringLen(value) > 0) {
+               g_check_values[check_num - 1] = value + "," + max_dd;
+            }
+         }
+      }
+   }
+   
+   FileClose(handle);
+   g_config_loaded = true;
+   Print("Config loaded from file: ", g_config_file);
+   Print("  LookbackDays: ", g_lookback_days);
+   Print("  RefreshRate: ", g_refresh_rate);
+   Print("  EnableAutoStop: ", g_enable_auto_stop);
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Save configuration to file                                        |
+//+------------------------------------------------------------------+
+void SaveConfigToFile() {
+   int handle = FileOpen(g_config_file, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE) {
+      Print("Failed to create config file: ", g_config_file, " Error: ", GetLastError());
+      return;
+   }
+   
+   // Write header comment
+   FileWrite(handle, "# DrawdownMonitor Configuration");
+   FileWrite(handle, "# Last Update", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
+   FileWrite(handle, "");
+   
+   // Write general settings
+   FileWrite(handle, "LookbackDays", IntegerToString(g_lookback_days));
+   FileWrite(handle, "RefreshRate", IntegerToString(g_refresh_rate));
+   FileWrite(handle, "HelpXPosition", IntegerToString(g_help_x_position));
+   FileWrite(handle, "EnableAutoStop", g_enable_auto_stop ? "true" : "false");
+   FileWrite(handle, "");
+   
+   // Write Check values
+   for(int i = 0; i < 20; i++) {
+      string check_name = "Check" + IntegerToString(i + 1);
+      if(StringLen(g_check_values[i]) > 0) {
+         // Split Magic,MaxDD
+         string parts[];
+         if(StringSplit(g_check_values[i], ',', parts) == 2) {
+            FileWrite(handle, check_name, parts[0], parts[1]);
+         } else {
+            FileWrite(handle, check_name, g_check_values[i], "");
+         }
+      } else {
+         FileWrite(handle, check_name, "", "");
+      }
+   }
+   
+   FileClose(handle);
+   Print("Config saved to file: ", g_config_file);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize runtime settings from input parameters                 |
+//+------------------------------------------------------------------+
+void InitSettingsFromInputs() {
+   g_lookback_days = InpLookbackDays;
+   g_refresh_rate = InpRefreshRateSeconds;
+   g_help_x_position = InpHelpXPosition;
+   g_enable_auto_stop = InpEnableAutoStop;
+   
+   // Copy input check values to runtime array
+   g_check_values[0] = InpCheck1; g_check_values[1] = InpCheck2;
+   g_check_values[2] = InpCheck3; g_check_values[3] = InpCheck4;
+   g_check_values[4] = InpCheck5; g_check_values[5] = InpCheck6;
+   g_check_values[6] = InpCheck7; g_check_values[7] = InpCheck8;
+   g_check_values[8] = InpCheck9; g_check_values[9] = InpCheck10;
+   g_check_values[10] = InpCheck11; g_check_values[11] = InpCheck12;
+   g_check_values[12] = InpCheck13; g_check_values[13] = InpCheck14;
+   g_check_values[14] = InpCheck15; g_check_values[15] = InpCheck16;
+   g_check_values[16] = InpCheck17; g_check_values[17] = InpCheck18;
+   g_check_values[18] = InpCheck19; g_check_values[19] = InpCheck20;
 }
