@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "AntiGravity Assistant"
 #property link      "https://github.com/google-deepmind/"
-#property version   "1.10"
+#property version   "0.80"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -677,7 +677,7 @@ void UpdateDashboard() {
    CreateInfoButton();
    
    // Title
-   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.10", 20, y_base, 12, clrWhite);
+   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v0.8 (BETA)", 20, y_base, 12, clrWhite);
    y_base += 26;
    
    if(show_help) {
