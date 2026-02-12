@@ -1,11 +1,11 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                        EquityDrawdownMonitor.mq5 |
 //|                                          AntiGravity Assistant   |
 //|                        https://github.com/google-deepmind/       |
 //+------------------------------------------------------------------+
 #property copyright "AntiGravity Assistant"
 #property link      "https://github.com/google-deepmind/"
-#property version   "0.80"
+#property version   "1.02
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -15,6 +15,7 @@ input int      InpLookbackDays       = 60;           // Lookback Days for Magic 
 input int      InpRefreshRateSeconds = 1;            // Refresh Rate (seconds)
 input int      InpHelpXPosition      = 950;          // Help Text X Position
 input bool     InpEnableAutoStop     = true;         // Enable Emergency Stop
+input double   InpTickModeThreshold  = 50.0;         // Tick Mode Threshold (% of MaxDD)
 
 // Drawdown limit configurations (format: "MagicNumber,MaxDrawdown")
 input string   InpCheck1  = "";  // Check 1: Magic,MaxDD
@@ -47,7 +48,11 @@ int g_lookback_days = 60;
 int g_refresh_rate = 1;
 int g_help_x_position = 950;
 bool g_enable_auto_stop = true;
+double g_tick_mode_threshold = 50.0;
 string g_check_values[20];
+
+//--- Tick mode state
+bool g_tick_mode = false;  // true = Tick-Modus aktiv, false = Timer-Modus
 
 //--- Class to monitor a single Magic Number
 class CMagicMonitor {
@@ -61,6 +66,7 @@ private:
    double   m_max_drawdown;
    double   m_max_allowed_drawdown; // Configured limit
    bool     m_emergency_stopped;    // Emergency stop flag
+   bool     m_resume_warning_sent;  // Flag to avoid spam when stopped magic resumes
    string   m_comment;              // EA comment (max 10 chars)
    
    // Optimization members
@@ -76,6 +82,7 @@ public:
       m_current_drawdown = 0.0;
       m_max_drawdown = 0.0;
       m_emergency_stopped = false;
+      m_resume_warning_sent = false;
       
       m_last_history_time = 0;
       m_last_deal_ticket = 0;
@@ -103,6 +110,15 @@ public:
    double GetMaxAllowedDrawdown() const { return m_max_allowed_drawdown; }
    bool IsEmergencyStopped() const { return m_emergency_stopped; }
    string GetComment() const { return m_comment; }
+   
+   // Check if drawdown is at or above the tick-mode threshold (percentage of max allowed DD)
+   bool IsAboveTickModeThreshold(double threshold_percent) const {
+      if(m_max_allowed_drawdown <= 0.0) return false;  // No limit = no tick mode
+      if(m_emergency_stopped) return false;             // Already stopped
+      double current_dd_percent = GetDrawdownPercent();
+      double threshold_dd = m_max_allowed_drawdown * (threshold_percent / 100.0);
+      return (current_dd_percent >= threshold_dd);
+   }
    
    color GetRowColor() const {
       if(m_emergency_stopped) return clrGray; // Stopped magic
@@ -154,6 +170,41 @@ public:
       
       // 5. Show alert
       ShowEmergencyAlert(m_magic, GetDrawdownPercent(), m_max_allowed_drawdown);
+   }
+   
+   void TriggerResumeWarning(int position_count) {
+      // Warning: A stopped magic has opened new positions!
+      
+      // 1. Send Email
+      string subject = "WARNING: Stopped Magic " + IntegerToString(m_magic) + " is trading again!";
+      string body = StringFormat(
+         "WARNUNG: GESTOPPTE MAGIC TRADET WIEDER!\n\n" +
+         "Magic Number: %d\n" +
+         "Anzahl neuer Positionen: %d\n\n" +
+         "Diese Magic wurde zuvor durch Emergency Stop gestoppt.\n" +
+         "Bitte prüfen Sie, ob der EA manuell neu gestartet wurde!\n\n" +
+         "Zeit: %s",
+         m_magic, 
+         position_count,
+         TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS)
+      );
+      
+      if(!SendMail(subject, body)) {
+         Print("Failed to send warning email. Check MT5 Email settings!");
+      }
+      
+      // 2. Log
+      Print("WARNING: Stopped Magic ", m_magic, " has ", position_count, " new open positions!");
+      
+      // 3. Show alert popup
+      string alert_text = StringFormat(
+         "WARNUNG!\n\n" +
+         "Magic %d war durch Emergency Stop gestoppt,\n" +
+         "hat aber jetzt %d neue Positionen eröffnet!\n\n" +
+         "Bitte prüfen Sie den EA!",
+         m_magic, position_count
+      );
+      MessageBox(alert_text, "Gestoppte Magic tradet wieder!", MB_OK | MB_ICONWARNING);
    }
 
    // Core logic to process history within a time range
@@ -316,11 +367,40 @@ public:
       }
       
       // Check for Manual Reset (User deleted Global Variable)
-      if(m_emergency_stopped) {
-         string var_name = "EDM_STOP_MAGIC_" + IntegerToString(m_magic);
-         if(!GlobalVariableCheck(var_name)) {
-            m_emergency_stopped = false;
-            Print("Manual Reset detected for Magic ", m_magic, " - Monitoring resumed!");
+	if(m_emergency_stopped) {
+   string var_name = "EDM_STOP_MAGIC_" + IntegerToString(m_magic);
+   if(!GlobalVariableCheck(var_name)) {
+      m_emergency_stopped = false;
+      m_resume_warning_sent = false; // Reset warning flag too
+      
+      // HIGH WATER MARK RESET: Neustart der Equity-Berechnung
+      // Realized Profit und Floating sind bereits aktuell (oben berechnet)
+      m_current_equity = m_realized_profit + m_floating_profit;
+      m_max_equity = m_current_equity;  // Neuer Startpunkt
+      m_current_drawdown = 0.0;         // Kein Drawdown nach Reset
+      m_max_drawdown = 0.0;             // Max DD auch zurücksetzen
+      
+      Print("Manual Reset detected for Magic ", m_magic, 
+            " - Monitoring resumed! New HWM: ", DoubleToString(m_max_equity, 2));
+   }
+}
+      
+      // Check for STOPPED magic opening new trades (WARNING!)
+      string stop_var = "EDM_STOP_MAGIC_" + IntegerToString(m_magic);
+      if(GlobalVariableCheck(stop_var) && !m_resume_warning_sent) {
+         // Check if there are any open positions for this magic
+         int pos_count = 0;
+         for(int i = 0; i < PositionsTotal(); i++) {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket > 0 && PositionGetInteger(POSITION_MAGIC) == m_magic) {
+               pos_count++;
+            }
+         }
+         
+         if(pos_count > 0) {
+            // Stopped magic has new positions! Send warning
+            m_resume_warning_sent = true;
+            TriggerResumeWarning(pos_count);
          }
       }
    }
@@ -330,6 +410,11 @@ public:
 CMagicMonitor *monitors[];
 int monitor_count = 0;
 bool show_help = false; // Toggle for help text display
+color g_orig_color_up;
+color g_orig_color_down;
+color g_orig_color_bull;
+color g_orig_color_bear;
+color g_orig_color_line;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -374,18 +459,27 @@ int OnInit()
       limit_values[i] = 0.0;
    }
    
+   
    for(int i = 0; i < 20; i++) {
       if(StringLen(g_check_values[i]) > 0) {
+         Print("DEBUG: Parsing g_check_values[", i, "] = '", g_check_values[i], "'");
          string parts[];
-         if(StringSplit(g_check_values[i], ',', parts) == 2) {
+         int split_count = StringSplit(g_check_values[i], ',', parts);
+         Print("DEBUG: Split into ", split_count, " parts");
+         
+         if(split_count == 2) {
             long magic = StringToInteger(parts[0]);
             double max_dd = StringToDouble(parts[1]);
+            Print("DEBUG: Parsed Magic=", magic, ", MaxDD=", max_dd);
             limit_magics[limit_count] = magic;
             limit_values[limit_count] = max_dd;
             limit_count++;
+         } else {
+            Print("WARNING: Check value has wrong format (expected 2 parts): '", g_check_values[i], "'");
          }
       }
    }
+   
    
    // Auto-discover Magic Numbers from history
    datetime lookback_time = TimeCurrent() - (g_lookback_days * 86400);
@@ -395,7 +489,7 @@ int OnInit()
       return(INIT_FAILED);
    }
    
-   // Collect unique magic numbers
+   // Collect unique magic numbers from history
    long discovered_magics[];
    int magic_count = 0;
    
@@ -426,7 +520,32 @@ int OnInit()
       }
    }
    
-   // Create monitors for discovered magics
+   Print("Discovered ", magic_count, " magic numbers from history (last ", g_lookback_days, " days)");
+   
+   // CRITICAL: Add Magic Numbers from config file that are not in history
+   // This ensures configured limits are always monitored, even for inactive magics
+   for(int i = 0; i < limit_count; i++) {
+      long config_magic = limit_magics[i];
+      
+      // Check if this magic is already in discovered list
+      bool found = false;
+      for(int j = 0; j < magic_count; j++) {
+         if(discovered_magics[j] == config_magic) {
+            found = true;
+            break;
+         }
+      }
+      
+      // If not found in history, add it now
+      if(!found) {
+         ArrayResize(discovered_magics, magic_count + 1);
+         discovered_magics[magic_count] = config_magic;
+         Print("Added Magic ", config_magic, " from config (not in recent history)");
+         magic_count++;
+      }
+   }
+   
+   // Create monitors for all unique magics (from history + config)
    monitor_count = magic_count;
    ArrayResize(monitors, monitor_count);
    
@@ -442,9 +561,25 @@ int OnInit()
       
       monitors[i] = new CMagicMonitor(discovered_magics[i], max_allowed);
       monitors[i].InitFromHistory();
+      
+      // Debug: Show what limit was assigned to this monitor
+      if(max_allowed > 0.0) {
+         Print("Monitor created: Magic ", discovered_magics[i], " with MaxDD limit: ", max_allowed, "%");
+      } else {
+         Print("Monitor created: Magic ", discovered_magics[i], " with NO limit");
+      }
    }
    
-   Print("Discovered ", monitor_count, " magic numbers in last ", g_lookback_days, " days");
+   Print("Total monitors created: ", monitor_count);
+   
+   // Debug: Print all configured limits
+   if(limit_count > 0) {
+      Print("=== Configured Drawdown Limits ===");
+      for(int i = 0; i < limit_count; i++) {
+         Print("  Magic ", limit_magics[i], " -> MaxDD: ", limit_values[i], "%");
+      }
+      Print("==================================");
+   }
    
    // Enumerate all charts and log their information
    Print("=== Chart Information ===");
@@ -501,6 +636,20 @@ int OnInit()
    }
    Print("=========================");
    
+   // Save original chart colors and hide bars
+   g_orig_color_up = (color)ChartGetInteger(0, CHART_COLOR_CHART_UP);
+   g_orig_color_down = (color)ChartGetInteger(0, CHART_COLOR_CHART_DOWN);
+   g_orig_color_bull = (color)ChartGetInteger(0, CHART_COLOR_CANDLE_BULL);
+   g_orig_color_bear = (color)ChartGetInteger(0, CHART_COLOR_CANDLE_BEAR);
+   g_orig_color_line = (color)ChartGetInteger(0, CHART_COLOR_CHART_LINE);
+
+   // Set chart bars to NONE to avoid interference with text
+   ChartSetInteger(0, CHART_COLOR_CHART_UP, clrNONE);
+   ChartSetInteger(0, CHART_COLOR_CHART_DOWN, clrNONE);
+   ChartSetInteger(0, CHART_COLOR_CANDLE_BULL, clrNONE);
+   ChartSetInteger(0, CHART_COLOR_CANDLE_BEAR, clrNONE);
+   ChartSetInteger(0, CHART_COLOR_CHART_LINE, clrNONE);
+
    // Setup timer
    EventSetTimer(g_refresh_rate);
    
@@ -515,6 +664,14 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   
+   // Restore chart colors
+   ChartSetInteger(0, CHART_COLOR_CHART_UP, g_orig_color_up);
+   ChartSetInteger(0, CHART_COLOR_CHART_DOWN, g_orig_color_down);
+   ChartSetInteger(0, CHART_COLOR_CANDLE_BULL, g_orig_color_bull);
+   ChartSetInteger(0, CHART_COLOR_CANDLE_BEAR, g_orig_color_bear);
+   ChartSetInteger(0, CHART_COLOR_CHART_LINE, g_orig_color_line);
+   
    ObjectsDeleteAll(0, "EDM_"); // Clear all our objects (labels and button)
    
    // Clean up memory
@@ -530,6 +687,13 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   if(g_tick_mode) {
+      for(int i = 0; i < monitor_count; i++) {
+         monitors[i].Update();
+      }
+      CheckAndSwitchMode();
+      UpdateDashboard();
+   }
   }
 //+------------------------------------------------------------------+
 //| Timer function                                                   |
@@ -539,6 +703,7 @@ void OnTimer()
    for(int i = 0; i < monitor_count; i++) {
       monitors[i].Update();
    }
+   CheckAndSwitchMode();
    UpdateDashboard();
   }
 //+------------------------------------------------------------------+
@@ -557,6 +722,28 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 //+------------------------------------------------------------------+
 //| Custom functions                                                 |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Check if tick mode should be activated or deactivated             |
+//+------------------------------------------------------------------+
+void CheckAndSwitchMode() {
+   bool need_tick_mode = false;
+   for(int i = 0; i < monitor_count; i++) {
+      if(monitors[i].IsAboveTickModeThreshold(g_tick_mode_threshold)) {
+         need_tick_mode = true;
+         break;
+      }
+   }
+   
+   if(need_tick_mode && !g_tick_mode) {
+      g_tick_mode = true;
+      Print("TICK MODE ACTIVATED - Drawdown threshold (", DoubleToString(g_tick_mode_threshold, 0), "% of MaxDD) reached!");
+   }
+   else if(!need_tick_mode && g_tick_mode) {
+      g_tick_mode = false;
+      Print("TIMER MODE RESTORED - All drawdowns below threshold.");
+   }
+}
+
 void CloseAllPositionsByMagic(long magic) {
    CTrade trade;
    trade.SetAsyncMode(false); // Synchronous mode
@@ -677,8 +864,21 @@ void UpdateDashboard() {
    CreateInfoButton();
    
    // Title
-   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v0.8 (BETA)", 20, y_base, 12, clrWhite);
+   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.01", 20, y_base, 12, clrWhite);
    y_base += 26;
+   
+   // Show current update mode
+   string mode_text;
+   color mode_color;
+   if(g_tick_mode) {
+      mode_text = "Update: TICK-MODUS (jeden Tick)";
+      mode_color = clrOrange;
+   } else {
+      mode_text = "Update: " + IntegerToString(g_refresh_rate) + "s Intervall";
+      mode_color = clrLime;
+   }
+   DrawLabel("EDM_Label_Mode", mode_text, 20, y_base, 10, mode_color);
+   y_base += y_step;
    
    if(show_help) {
       // Show help instead of table
@@ -762,8 +962,11 @@ bool LoadConfigFromFile() {
       
       // Skip empty lines and comments
       if(StringLen(key) == 0 || StringGetCharacter(key, 0) == '#') {
+         Print("DEBUG LoadConfig: Skipping key='", key, "' (empty or comment)");
          continue;
       }
+      
+      Print("DEBUG LoadConfig: Processing key='", key, "', value='", value, "'");
       
       // Parse settings
       if(key == "LookbackDays") {
@@ -781,11 +984,18 @@ bool LoadConfigFromFile() {
       else if(StringFind(key, "Check") == 0) {
          // Parse Check1, Check2, etc.
          int check_num = (int)StringToInteger(StringSubstr(key, 5));
+         Print("DEBUG LoadConfig: Found key='", key, "', check_num=", check_num, ", value='", value, "'");
+         
          if(check_num >= 1 && check_num <= 20) {
             // Read the third column (MaxDD value)
             string max_dd = FileReadString(handle);
+            Print("DEBUG LoadConfig: Read max_dd='", max_dd, "'");
+            
             if(StringLen(value) > 0) {
                g_check_values[check_num - 1] = value + "," + max_dd;
+               Print("DEBUG LoadConfig: Set g_check_values[", check_num - 1, "] = '", g_check_values[check_num - 1], "'");
+            } else {
+               Print("DEBUG LoadConfig: Skipped (value is empty)");
             }
          }
       }
@@ -813,7 +1023,7 @@ void SaveConfigToFile() {
    
    // Write header comment
    FileWrite(handle, "# DrawdownMonitor Configuration");
-   FileWrite(handle, "# Last Update", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
+   FileWrite(handle, "# Last Update: " + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
    FileWrite(handle, "");
    
    // Write general settings
@@ -851,6 +1061,7 @@ void InitSettingsFromInputs() {
    g_refresh_rate = InpRefreshRateSeconds;
    g_help_x_position = InpHelpXPosition;
    g_enable_auto_stop = InpEnableAutoStop;
+   g_tick_mode_threshold = InpTickModeThreshold;
    
    // Copy input check values to runtime array
    g_check_values[0] = InpCheck1; g_check_values[1] = InpCheck2;
