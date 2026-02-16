@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "AntiGravity Assistant"
 #property link      "https://github.com/google-deepmind/"
-#property version   "1.02
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -15,7 +15,7 @@ input int      InpLookbackDays       = 60;           // Lookback Days for Magic 
 input int      InpRefreshRateSeconds = 1;            // Refresh Rate (seconds)
 input int      InpHelpXPosition      = 950;          // Help Text X Position
 input bool     InpEnableAutoStop     = true;         // Enable Emergency Stop
-input double   InpTickModeThreshold  = 50.0;         // Tick Mode Threshold (% of MaxDD)
+input double   InpTickModeThreshold  = 35.0;         // Tick Mode Threshold (% of MaxDD)
 
 // Drawdown limit configurations (format: "MagicNumber,MaxDrawdown")
 input string   InpCheck1  = "";  // Check 1: Magic,MaxDD
@@ -48,7 +48,7 @@ int g_lookback_days = 60;
 int g_refresh_rate = 1;
 int g_help_x_position = 950;
 bool g_enable_auto_stop = true;
-double g_tick_mode_threshold = 50.0;
+double g_tick_mode_threshold = 35.0;
 string g_check_values[20];
 
 //--- Tick mode state
@@ -139,14 +139,19 @@ public:
       
       m_emergency_stopped = true;
       
-      // 1. Close all positions for this magic
-      CloseAllPositionsByMagic(m_magic);
-      
-      // 2. Set global variable
+      // 1. Set global variable FIRST - so other EAs stop immediately before we close
       string var_name = "EDM_STOP_MAGIC_" + IntegerToString(m_magic);
       GlobalVariableSet(var_name, 1);
       
-      // 3. Send Email
+      // 2. Close all positions for this magic
+      CloseAllPositionsByMagic(m_magic);
+      
+      // 3. Log
+      Print("EMERGENCY STOP triggered for Magic ", m_magic, 
+            " DD%=", DoubleToString(GetDrawdownPercent(), 2), 
+            " Limit%=", DoubleToString(m_max_allowed_drawdown, 1));
+      
+      // 4. Send Email
       string subject = "EMERGENCY STOP - Magic " + IntegerToString(m_magic);
       string body = StringFormat(
          "DRAWDOWN LIMIT ERREICHT!\n\n" +
@@ -165,11 +170,11 @@ public:
          Print("Failed to send email. Check MT5 Email settings!");
       }
       
-      // 4. Log
-      Print("EMERGENCY STOP triggered for Magic ", m_magic);
-      
-      // 5. Show alert
-      ShowEmergencyAlert(m_magic, GetDrawdownPercent(), m_max_allowed_drawdown);
+      // 5. Non-blocking alert (Alert statt MessageBox - blockiert den EA NICHT)
+      Alert("EMERGENCY STOP Magic ", m_magic, 
+            " | DD: ", DoubleToString(GetDrawdownPercent(), 1), "%",
+            " | Limit: ", DoubleToString(m_max_allowed_drawdown, 1), "%",
+            " | Alle Positionen geschlossen!");
    }
    
    void TriggerResumeWarning(int position_count) {
@@ -259,11 +264,24 @@ public:
          FindCommentFromPositions();
       }
       
-      // Initialize equity - this is the starting point, the "high water mark"
-      m_current_equity = m_realized_profit;
-      // Start with current equity as max (even if negative - it's still the highest we've seen)
+      // Calculate current floating profit for accurate HWM initialization
+      double init_floating = 0.0;
+      int total_pos = PositionsTotal();
+      for(int i = 0; i < total_pos; i++) {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0) {
+            if(PositionGetInteger(POSITION_MAGIC) == m_magic) {
+               init_floating += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+            }
+         }
+      }
+      m_floating_profit = init_floating;
+      
+      // Initialize equity INCLUDING floating profit - this is the true starting point
+      m_current_equity = m_realized_profit + m_floating_profit;
+      // Start with current equity as max (the true High Water Mark at startup)
       m_max_equity = m_current_equity;
-      // No drawdown at start
+      // No drawdown at start - we measure only NEW drawdown from this point forward
       m_current_drawdown = 0.0;
    }
    
@@ -746,19 +764,62 @@ void CheckAndSwitchMode() {
 
 void CloseAllPositionsByMagic(long magic) {
    CTrade trade;
-   trade.SetAsyncMode(false); // Synchronous mode
+   trade.SetAsyncMode(true); // Asynchronous mode - alle Close-Orders parallel senden
    
-   // Loop backwards to handle position array changes
+   // Zuerst alle Tickets sammeln, dann alle Close-Orders auf einmal senden
+   ulong tickets[];
+   int ticket_count = 0;
+   
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(ticket > 0) {
          if(PositionGetInteger(POSITION_MAGIC) == magic) {
-            if(!trade.PositionClose(ticket)) {
-               Print("Failed to close position ", ticket, " for Magic ", magic, ". Error: ", GetLastError());
-            } else {
-               Print("Closed position ", ticket, " for Magic ", magic);
+            ArrayResize(tickets, ticket_count + 1);
+            tickets[ticket_count] = ticket;
+            ticket_count++;
+         }
+      }
+   }
+   
+   Print("Emergency Close: Sending ", ticket_count, " async close orders for Magic ", magic);
+   
+   // Alle Close-Orders so schnell wie möglich absenden (async = nicht auf Antwort warten)
+   for(int i = 0; i < ticket_count; i++) {
+      if(!trade.PositionClose(tickets[i])) {
+         Print("Failed to send close for position ", tickets[i], " Magic ", magic, ". Error: ", GetLastError());
+      } else {
+         Print("Async close sent for position ", tickets[i], " Magic ", magic);
+      }
+   }
+   
+   // Kurz warten, dann prüfen ob alle geschlossen wurden
+   if(ticket_count > 0) {
+      Sleep(500); // 500ms warten
+      
+      // Prüfen ob noch Positionen offen sind, falls ja nochmal versuchen
+      int remaining = 0;
+      for(int i = PositionsTotal()-1; i >= 0; i--) {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0 && PositionGetInteger(POSITION_MAGIC) == magic) {
+            remaining++;
+         }
+      }
+      
+      if(remaining > 0) {
+         Print("WARNING: ", remaining, " positions still open after async close. Retrying synchronously...");
+         trade.SetAsyncMode(false); // Jetzt synchron für die verbleibenden
+         for(int i = PositionsTotal()-1; i >= 0; i--) {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket > 0 && PositionGetInteger(POSITION_MAGIC) == magic) {
+               if(!trade.PositionClose(ticket)) {
+                  Print("RETRY FAILED: position ", ticket, " Magic ", magic, ". Error: ", GetLastError());
+               } else {
+                  Print("Retry closed position ", ticket, " Magic ", magic);
+               }
             }
          }
+      } else {
+         Print("All ", ticket_count, " positions closed successfully for Magic ", magic);
       }
    }
 }
