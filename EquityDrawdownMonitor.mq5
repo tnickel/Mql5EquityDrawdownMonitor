@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "AntiGravity Assistant"
 #property link      "https://github.com/google-deepmind/"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -201,15 +201,8 @@ public:
       // 2. Log
       Print("WARNING: Stopped Magic ", m_magic, " has ", position_count, " new open positions!");
       
-      // 3. Show alert popup
-      string alert_text = StringFormat(
-         "WARNUNG!\n\n" +
-         "Magic %d war durch Emergency Stop gestoppt,\n" +
-         "hat aber jetzt %d neue Positionen eröffnet!\n\n" +
-         "Bitte prüfen Sie den EA!",
-         m_magic, position_count
-      );
-      MessageBox(alert_text, "Gestoppte Magic tradet wieder!", MB_OK | MB_ICONWARNING);
+      // 3. Non-blocking alert (Alert statt MessageBox - blockiert den EA NICHT)
+      Alert("WARNUNG! Magic ", m_magic, " (gestoppt) hat ", position_count, " neue Positionen! BITTE EA PRÜFEN!");
    }
 
    // Core logic to process history within a time range
@@ -278,11 +271,22 @@ public:
       m_floating_profit = init_floating;
       
       // Initialize equity INCLUDING floating profit - this is the true starting point
+      
+      // Initialize equity INCLUDING floating profit - this is the true starting point
       m_current_equity = m_realized_profit + m_floating_profit;
-      // Start with current equity as max (the true High Water Mark at startup)
-      m_max_equity = m_current_equity;
-      // No drawdown at start - we measure only NEW drawdown from this point forward
-      m_current_drawdown = 0.0;
+      
+      // CORRECT INITIALIZATION:
+      // If we are currently in a drawdown (Equity < Realized), the High Water Mark implies
+      // we were at least at Realized Profit level (assuming 0 start).
+      // So HWM should be max(Realized, Current).
+      m_max_equity = MathMax(m_realized_profit, m_current_equity);
+      
+      // Recalculate drawdown immediately based on this corrected HWM
+      if(m_current_equity < m_max_equity) {
+         m_current_drawdown = m_max_equity - m_current_equity;
+      } else {
+         m_current_drawdown = 0.0;
+      }
    }
    
    // Find comment from deal history
@@ -709,8 +713,20 @@ void OnTick()
       for(int i = 0; i < monitor_count; i++) {
          monitors[i].Update();
       }
+      
+      bool old_mode = g_tick_mode;
       CheckAndSwitchMode();
-      UpdateDashboard();
+      
+      // Update logic:
+      // 1. If mode changed (Tick -> Timer), update immediately
+      // 2. Otherwise warn only every 1000ms (1 second) to save resources
+      static ulong last_update = 0;
+      ulong current_tick = GetTickCount();
+      
+      if(g_tick_mode != old_mode || (current_tick - last_update > 1000)) {
+         UpdateDashboard();
+         last_update = current_tick;
+      }
    }
   }
 //+------------------------------------------------------------------+
@@ -838,7 +854,11 @@ void ShowEmergencyAlert(long magic, double dd_percent, double limit) {
       magic, dd_percent, limit, magic
    );
    
-   MessageBox(message, "EMERGENCY STOP - Magic " + IntegerToString(magic), MB_OK | MB_ICONERROR);
+   // Non-blocking alert
+   Alert("EMERGENCY STOP Magic ", magic, 
+         " | DD: ", DoubleToString(dd_percent, 1), "%",
+         " | Limit: ", DoubleToString(limit, 1), "%",
+         " | Alle Positionen geschlossen! (GlobalVar gesetzt)");
 }
 
 void DrawLabel(string name, string text, int x, int y, int size=10, color clr=clrWhite) {
@@ -925,7 +945,7 @@ void UpdateDashboard() {
    CreateInfoButton();
    
    // Title
-   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.01", 20, y_base, 12, clrWhite);
+   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.04", 20, y_base, 12, clrWhite);
    y_base += 26;
    
    // Show current update mode
