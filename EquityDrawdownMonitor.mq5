@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "AntiGravity Assistant"
 #property link      "https://github.com/google-deepmind/"
-#property version   "1.04"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -610,10 +610,6 @@ int OnInit()
       string comment;
       ChartGetString(cid, CHART_COMMENT, comment);
       
-      Print("Chart ID: ", cid,
-            " | Symbol: ", ChartSymbol(cid),
-            " | Period: ", EnumToString((ENUM_TIMEFRAMES)ChartPeriod(cid)),
-            " | Comment: ", comment);
             
       // List objects on this chart
       int obj_total = ObjectsTotal(cid);
@@ -652,7 +648,6 @@ int OnInit()
          if(unique_count < 5 && obj_total > scan_limit) obj_summary += ", ...";
       }
       
-      Print("   -> Objects: ", obj_total, " | Types: ", obj_summary);
       
       cid = ChartNext(cid);
    }
@@ -945,7 +940,7 @@ void UpdateDashboard() {
    CreateInfoButton();
    
    // Title
-   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.04", 20, y_base, 12, clrWhite);
+   DrawLabel("EDM_Label_Title", "Equity Drawdown Monitor v1.05", 20, y_base, 12, clrWhite);
    y_base += 26;
    
    // Show current update mode
